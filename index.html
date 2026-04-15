@@ -662,7 +662,6 @@
   </div>
 </div>
 
-<script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <script>
 /* ══════════════════════════════════════════════════════
@@ -737,17 +736,38 @@ function initChart() {
 }
 
 /* ══════════════════════════════════════════════════════
-   SOCKET.IO
+   DWEET.IO PUBLIC BRIDGE
 ══════════════════════════════════════════════════════ */
-const socket = io({ transports: ['websocket', 'polling'] });
+const THING_NAME = "eldercare-fall-goura";
+let prevFallState = false;
+let eventHistory = [];
 
-socket.on('connect', () => setConnBadge(true));
-socket.on('disconnect', () => setConnBadge(false));
+async function pollDweet() {
+  try {
+    const res = await fetch(`https://dweet.io/get/latest/dweet/for/${THING_NAME}`);
+    if (!res.ok) throw new Error("Dweet offline");
+    const json = await res.json();
+    if (json.with && json.with.length > 0) {
+      const data = json.with[0].content;
+      data.online = true; // ensure standard display logic works
 
-socket.on('fall_update',      data => updateFallUI(data));
-socket.on('heartrate_update', data => updateHRUI(data));
-socket.on('medicine_update',  data => updateMedicineUI(data));
-socket.on('new_event',        event => { prependEvent(event); alertCount++; updateAlertCount(); });
+      // Simulate local events that the backend used to do
+      if (data.is_fall && !prevFallState) {
+        data.last_fall_time = new Date().toLocaleString();
+        logEventLocal("fall", "🚨 FALL DETECTED — Immediate attention required!", "critical");
+      }
+      prevFallState = !!data.is_fall;
+
+      updateFallUI(data);
+      setConnBadge(true);
+    }
+  } catch(e) {
+    setConnBadge(false);
+  }
+}
+
+// Start watching!
+setInterval(pollDweet, 1500);
 
 function setConnBadge(connected) {
   const badge = document.getElementById('conn-badge');
@@ -756,29 +776,41 @@ function setConnBadge(connected) {
   text.textContent = connected ? 'Live' : 'Disconnected';
 }
 
-/* ══════════════════════════════════════════════════════
-   INITIAL DATA LOAD
-══════════════════════════════════════════════════════ */
-async function loadInitialData() {
-  try {
-    const [statusRes, eventsRes] = await Promise.all([
-      fetch('/api/status'),
-      fetch('/api/events'),
-    ]);
-    const status = await statusRes.json();
-    const events = await eventsRes.json();
-
-    updateFallUI(status.fall || {});
-    updateHRUI({ ...(status.heartrate || {}), bpm_history: status.bpm_history || [] });
-    updateMedicineUI(status.medicine || {});
-
-    // Load events oldest-first
-    [...events].reverse().forEach(ev => prependEvent(ev));
-    alertCount = events.filter(e => e.severity !== 'info').length;
+function logEventLocal(type, message, severity) {
+  const ev = { type, message, severity, timestamp: new Date().toLocaleString() };
+  prependEvent(ev);
+  if (severity !== 'info') {
+    alertCount++;
     updateAlertCount();
-  } catch (e) {
-    console.warn('Initial data load failed:', e);
   }
+  eventHistory.unshift(ev);
+  if (eventHistory.length > 60) eventHistory.pop();
+  localStorage.setItem('eldercare_events', JSON.stringify(eventHistory));
+}
+
+/* ══════════════════════════════════════════════════════
+   INITIAL DATA LOAD (LOCAL STORAGE)
+══════════════════════════════════════════════════════ */
+function loadInitialData() {
+  try {
+    const stored = localStorage.getItem('eldercare_events');
+    if (stored) {
+      eventHistory = JSON.parse(stored);
+      [...eventHistory].reverse().forEach(ev => prependEvent(ev));
+      alertCount = eventHistory.filter(e => e.severity !== 'info').length;
+      updateAlertCount();
+    }
+    const schedStored = localStorage.getItem('eldercare_schedule');
+    if (schedStored) {
+      currentSchedule = JSON.parse(schedStored);
+      renderScheduleList(currentSchedule);
+    }
+  } catch(e) {
+    console.warn('Failed to load local events:', e);
+  }
+  
+  // Kick off first poll!
+  pollDweet();
 }
 
 /* ══════════════════════════════════════════════════════
@@ -1008,21 +1040,15 @@ function addScheduleTime() {
   inputs.appendChild(row);
 }
 
-async function saveSchedule() {
+function saveSchedule() {
   const rows = document.querySelectorAll('#schedule-inputs input[type="time"]');
   const schedule = [...rows].map(r => r.value).filter(Boolean).sort();
-  try {
-    await fetch('/api/medicine/schedule', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ schedule }),
-    });
-    currentSchedule = schedule;
-    renderScheduleList(schedule);
-    toggleScheduleEdit();
-  } catch (e) {
-    alert('Failed to save schedule. Is the server running?');
-  }
+  
+  localStorage.setItem('eldercare_schedule', JSON.stringify(schedule));
+  currentSchedule = schedule;
+  renderScheduleList(schedule);
+  toggleScheduleEdit();
+  logEventLocal("medicine", `📅 Reminder schedule updated: ${schedule.length > 0 ? schedule.join(', ') : 'None'}`, "info");
 }
 
 /* ══════════════════════════════════════════════════════
